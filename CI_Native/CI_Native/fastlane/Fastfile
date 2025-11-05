@@ -1,0 +1,185 @@
+org, repo             = (ENV["GITHUB_REPOSITORY"] || "").split("/")
+match_org, match_repo = (ENV["MATCH_REPOSITORY"]  || "").split("/")
+
+platform :ios do
+  desc "Initialize CI with writable deploy key (one-time)"
+  lane :init_ci do
+    github_action(
+      api_token:  ENV["GH_PAT"],
+      org:        org,
+      repo:       repo,
+      match_org:  match_org,
+      match_repo: match_repo,
+      writable_deploy_key: true
+    )
+  end
+
+  desc "Sync codesigning certificates (WRITE), как в CI_Core"
+  lane :sync_certificates do
+    app_store_connect_api_key(
+      key_id:      ENV["APPSTORE_KEY_ID"],
+      issuer_id:   ENV["APPSTORE_ISSUER_ID"],
+      key_content: ENV["APPSTORE_P8"]
+    )
+
+    main_app_bundle_id = ENV["IOS_BUNDLE_ID"]
+    extension_bundle_id = "#{ENV["IOS_BUNDLE_ID"]}.notifications"
+
+    match(
+      type: "appstore",
+      storage_mode: "git",
+      git_url: "git@github.com:#{match_org}/#{match_repo}.git",
+      app_identifier: [main_app_bundle_id, extension_bundle_id],
+      readonly: false
+    )
+  end
+
+  desc "Build .ipa for App Store (native)"
+  lane :build do
+    setup_ci
+    sync_certificates
+
+    scheme          = (ENV["IOS_SCHEME"] || ENV["PROJECT_NAME"]).to_s.strip
+    workspace_input = (ENV["XCODE_WORKSPACE"] || "").to_s.strip
+    project_input   = (ENV["XCODE_PROJECT"]   || "").to_s.strip
+    project_input   = "#{ENV["PROJECT_NAME"]}.xcodeproj" if project_input.empty? && !ENV["PROJECT_NAME"].to_s.empty?
+
+    repo_root = File.expand_path("..", __dir__)
+    workspace_path = workspace_input.empty? ? nil : File.expand_path(workspace_input, repo_root)
+    project_path   = project_input.empty?   ? nil : File.expand_path(project_input,   repo_root)
+
+    if workspace_path.nil? && project_path.nil?
+      found_ws = Dir[File.join(repo_root, "*.xcworkspace")].first
+      found_pr = Dir[File.join(repo_root, "*.xcodeproj")].first
+      workspace_path = found_ws if found_ws
+      project_path   = found_pr if found_pr
+    end
+
+    UI.user_error!("❌ Не найден workspace или project — укажи XCODE_WORKSPACE или PROJECT_NAME.") if workspace_path.nil? && project_path.nil?
+    UI.user_error!("❌ Не указана схема сборки (IOS_SCHEME/PROJECT_NAME).") if scheme.empty?
+
+    UI.message "📂 repo_root: #{repo_root}"
+    UI.message "➡️  Using scheme: #{scheme}"
+    UI.message "➡️  Using workspace: #{workspace_path}" if workspace_path
+    UI.message "➡️  Using project:   #{project_path}"   if project_path
+
+    # ==== автоинкремент CFBundleVersion ====
+    main_bundle = ENV["IOS_BUNDLE_ID"]
+    api_key_hash = {
+      key_id: ENV["APPSTORE_KEY_ID"],
+      issuer_id: ENV["APPSTORE_ISSUER_ID"],
+      key_content: ENV["APPSTORE_P8"]
+    }
+
+    latest_store_build = (
+      begin
+        app_store_build_number(app_identifier: main_bundle, api_key: api_key_hash)
+      rescue
+        0
+      end
+    ).to_i
+
+    ci_build   = ENV["BUILD_NUMBER"].to_i
+    next_build = [latest_store_build + 1, ci_build, 1].max
+
+    UI.message "ℹ️  App Store latest build: #{latest_store_build}"
+    UI.message "ℹ️  CI build number:       #{ci_build}"
+    UI.message "➡️  Using CFBundleVersion:  #{next_build}"
+
+    auto_xcodeproj = project_path || Dir[File.join(repo_root, "*.xcodeproj")].first
+    if auto_xcodeproj && File.exist?(auto_xcodeproj)
+      increment_build_number(xcodeproj: auto_xcodeproj, build_number: next_build)
+    else
+      increment_build_number(build_number: next_build)
+    end
+
+    ext_info_plist = Dir[File.join(repo_root, "ImageNotificationServiceExt", "**/Info.plist")].first
+    if ext_info_plist && File.exist?(ext_info_plist)
+      set_info_plist_value(path: ext_info_plist, key: "CFBundleVersion", value: next_build.to_s)
+    end
+    # ==== конец автоинкремента ====
+
+    ext_bundle  = "#{main_bundle}.notifications"
+    main_team_id  = ENV["sigh_#{main_bundle}_appstore_team-id"]
+    main_profile  = ENV["sigh_#{main_bundle}_appstore_profile-name"]
+    ext_profile   = ENV["sigh_#{ext_bundle}_appstore_profile-name"]
+
+    main_target  = ENV["IOS_MAIN_TARGET"].to_s.empty? ? scheme : ENV["IOS_MAIN_TARGET"]
+    notif_target = ENV["IOS_NOTIF_TARGET"].to_s.empty? ? "ImageNotificationServiceExt" : ENV["IOS_NOTIF_TARGET"]
+
+    project_or_workspace_path = project_path || workspace_path
+
+    update_code_signing_settings(
+      use_automatic_signing: false,
+      team_id: main_team_id,
+      code_sign_identity: "Apple Distribution",
+      path: project_or_workspace_path,
+      targets: main_target,
+      profile_name: main_profile
+    )
+
+    update_code_signing_settings(
+      use_automatic_signing: false,
+      team_id: main_team_id,
+      code_sign_identity: "Apple Distribution",
+      path: project_or_workspace_path,
+      targets: notif_target,
+      profile_name: ext_profile
+    )
+
+    provisioning_profiles = {}
+    provisioning_profiles[main_bundle] = main_profile if main_bundle && main_profile
+    provisioning_profiles[ext_bundle]  = ext_profile  if ext_bundle  && ext_profile
+
+    ipa_output_dir = File.join(repo_root, "build/iOS/ipa_out")
+
+    common = {
+      scheme: scheme,
+      export_method: "app-store",
+      export_team_id: main_team_id,
+      xcargs: "DEVELOPMENT_TEAM=#{main_team_id} CODE_SIGN_IDENTITY='Apple Distribution'",
+      output_directory: ipa_output_dir,
+      export_options: {
+        method: "app-store",
+        provisioningProfiles: provisioning_profiles
+      }
+    }
+
+    if workspace_path
+      build_app(common.merge(workspace: workspace_path))
+    else
+      build_app(common.merge(project: project_path))
+    end
+
+    app_store_connect_api_key(
+      key_id:      ENV["APPSTORE_KEY_ID"],
+      issuer_id:   ENV["APPSTORE_ISSUER_ID"],
+      key_content: ENV["APPSTORE_P8"]
+    )
+
+    ipa_path = Dir[File.join(ipa_output_dir, "*.ipa")].first
+    UI.user_error!("❌ IPA не найден по пути #{ipa_output_dir}") if ipa_path.nil?
+    UI.message "📦 IPA для загрузки: #{ipa_path}"
+
+    if ENV["UPLOAD_TO_TESTFLIGHT"] == "1" || ENV["UPLOAD_CHANNEL"] == "beta"
+      upload_to_testflight(
+        ipa: ipa_path,
+        skip_waiting_for_build_processing: true,
+        changelog: (ENV["CHANGELOG"] || "Auto-upload from CI")
+      )
+    else
+      upload_to_app_store(
+        ipa: ipa_path,
+        submit_for_review: false,
+        automatic_release: false,
+        force: true,
+        skip_screenshots: true,
+        skip_metadata: true,
+        run_precheck_before_submit: false,
+        app_identifier: ENV["IOS_BUNDLE_ID"]
+      )
+    end
+
+    UI.success("🎉 Билд загружен в App Store Connect!")
+  end
+end

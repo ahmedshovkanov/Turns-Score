@@ -1,0 +1,22 @@
+name: iOS One-Time Setup (native)
+on:
+  workflow_dispatch:
+
+jobs:
+  setup:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+          bundler-cache: true
+
+      - name: Init CI (creates writable deploy key & config)
+        env:
+          GH_PAT:            ${{ secrets.GH_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          MATCH_REPOSITORY:  ${{ secrets.MATCH_REPOSITORY }}
+        run: |
+          bundle exec fastlane ios init_ci

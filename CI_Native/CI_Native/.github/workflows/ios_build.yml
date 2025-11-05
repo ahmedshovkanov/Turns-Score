@@ -1,0 +1,83 @@
+name: Build iOS (native)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+          bundler-cache: true
+
+      - name: Setup SSH for match (CI_Core style)
+        env:
+          MATCH_DEPLOY_KEY: ${{ secrets.MATCH_DEPLOY_KEY }}
+          MATCH_REPOSITORY: ${{ secrets.MATCH_REPOSITORY }}   # org/repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${MATCH_DEPLOY_KEY:-}" ]; then
+            echo "⚠️  MATCH_DEPLOY_KEY is empty, skipping SSH setup"
+            exit 0
+          fi
+          eval "$(ssh-agent -s)"
+          ssh-add - <<< "${MATCH_DEPLOY_KEY}"
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          umask 177
+          echo "${MATCH_DEPLOY_KEY}" > ~/.ssh/id_match
+          chmod 600 ~/.ssh/id_match
+
+          {
+            echo "Host github.com"
+            echo "  HostName github.com"
+            echo "  IdentityFile ~/.ssh/id_match"
+            echo "  IdentitiesOnly yes"
+            echo "  StrictHostKeyChecking accept-new"
+          } > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+          ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Dump full repo tree (no limits)
+        run: |
+          echo "::group::Repository tree"
+          find . -print | sed -e 's;[^/]*/;|____;g;s;____|; |;g'
+          echo "::endgroup::"
+
+      - name: Build (нативный через Fastlane)
+        env:
+          # App Store Connect
+          APPSTORE_ISSUER_ID:  ${{ secrets.APPSTORE_ISSUER_ID }}
+          APPSTORE_KEY_ID:     ${{ secrets.APPSTORE_KEY_ID }}
+          APPSTORE_P8:         ${{ secrets.APPSTORE_P8 }}
+
+          # Bundle ID
+          IOS_BUNDLE_ID:       ${{ secrets.IOS_BUNDLE_ID }}
+
+          # match/git
+          GH_PAT:              ${{ secrets.GH_PAT }}
+          GITHUB_REPOSITORY:   ${{ github.repository }}
+          MATCH_REPOSITORY:    ${{ secrets.MATCH_REPOSITORY }}
+          MATCH_PASSWORD:      ${{ secrets.MATCH_PASSWORD }}
+          MATCH_DEPLOY_KEY:    ${{ secrets.MATCH_DEPLOY_KEY }}
+
+          # Параметры сборки
+          IOS_SCHEME:          ${{ secrets.IOS_SCHEME }}       
+          PROJECT_NAME:        ${{ secrets.PROJECT_NAME }}     
+          # XCODE_WORKSPACE:   ${{ secrets.XCODE_WORKSPACE }}  
+          # XCODE_PROJECT:     ${{ secrets.XCODE_PROJECT }}    
+          BUILD_NUMBER:        ${{ github.run_number }}
+          GIT_FULL_NAME:       ci-bot
+          GIT_USER_EMAIL:      ci-bot@local
+        shell: bash
+        run: |
+          git config --global user.name  "${GIT_FULL_NAME}"
+          git config --global user.email "${GIT_USER_EMAIL}"
+          bundle exec fastlane ios build
