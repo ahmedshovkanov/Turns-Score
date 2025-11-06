@@ -456,11 +456,12 @@ class SplashViewModel: ObservableObject {
         
         // усли не с пуша открыли запрашиваем
         if webViewURL == nil {
-            if !UserDefaults.standard.bool(forKey: "accepted_notifications") && !UserDefaults.standard.bool(forKey: "system_close_notifications") {
-                checkAndShowNotificationScreen()
-            } else {
-                sendConfigRequest()
-            }
+            sendConfigRequest()
+//            if !UserDefaults.standard.bool(forKey: "accepted_notifications") && !UserDefaults.standard.bool(forKey: "system_close_notifications") {
+//                checkAndShowNotificationScreen()
+//            } else {
+//                
+//            }
         }
     }
     
