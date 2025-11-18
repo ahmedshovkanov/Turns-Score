@@ -6,6 +6,43 @@ import WebKit
 import Network
 import AppTrackingTransparency
 import FirebaseCore
+import Combine
+
+// Centralized network monitor (inlined to ensure it's compiled in the app target).
+final class NetworkMonitor: ObservableObject {
+    static let shared = NetworkMonitor()
+
+    @Published private(set) var isConnected: Bool = true
+
+    private let monitor = NWPathMonitor()
+    private let queue = DispatchQueue(label: "NetworkMonitor")
+
+    private init() {
+        start()
+    }
+
+    func start() {
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self = self else { return }
+            let connected = path.status == .satisfied
+            if self.isConnected != connected {
+                DispatchQueue.main.async {
+                    self.isConnected = connected
+                    NotificationCenter.default.post(name: .networkStatusChanged, object: nil, userInfo: ["isConnected": connected])
+                }
+            }
+        }
+        monitor.start(queue: queue)
+    }
+
+    func stop() {
+        monitor.cancel()
+    }
+}
+
+extension Notification.Name {
+    static let networkStatusChanged = Notification.Name("NetworkMonitorStatusChanged")
+}
 
 class AppDelegate: UIResponder, UIApplicationDelegate, AppsFlyerLibDelegate, MessagingDelegate, UNUserNotificationCenterDelegate, DeepLinkDelegate {
     
@@ -18,15 +55,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate, AppsFlyerLibDelegate, Mes
     private var isFirstLaunch: Bool = true
     
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        
-        let monitor = NWPathMonitor()
-        monitor.pathUpdateHandler = { path in
-            if path.status != .satisfied {
-                self.handleNoInternet()
-                return
-            }
-        }
-        monitor.start(queue: DispatchQueue.global())
+        // Start centralized network monitor
+        _ = NetworkMonitor.shared
         
         // Initialize Firebase
         FirebaseApp.configure()
@@ -356,6 +386,7 @@ class SplashViewModel: ObservableObject {
     private var isFirstLaunch: Bool {
         !UserDefaults.standard.bool(forKey: "hasLaunched")
     }
+    private var cancellables = Set<AnyCancellable>()
     
     enum Screen {
         case loading
@@ -372,8 +403,24 @@ class SplashViewModel: ObservableObject {
         NotificationCenter.default.addObserver(self, selector: #selector(handleFCMToken(_:)), name: NSNotification.Name("FCMTokenUpdated"), object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(retryConfig), name: NSNotification.Name("RetryConfig"), object: nil)
         
-        // Start processing
+        // Start processing and subscribe to centralized network monitor
         checkInternetAndProceed()
+        NetworkMonitor.shared.$isConnected
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] connected in
+                guard let self = self else { return }
+                if connected {
+                    // When connection becomes available, try to proceed
+                    if self.currentScreen == .noInternet {
+                        // Retry config when we were showing no internet
+                        self.sendConfigRequest()
+                    }
+                } else {
+                    // Handle offline state
+                    self.handleNoInternet()
+                }
+            }
+            .store(in: &cancellables)
     }
     
     deinit {
@@ -381,17 +428,18 @@ class SplashViewModel: ObservableObject {
     }
     
     private func checkInternetAndProceed() {
-        let monitor = NWPathMonitor()
-        monitor.pathUpdateHandler = { path in
-            DispatchQueue.main.async {
-                if path.status != .satisfied {
-                    self.handleNoInternet()
-                } else {
-                    // self.checkExpiresAndRequest()
-                }
+        // Initial check: if network is available, just ensure we are not offline.
+        // Keep original behaviour: don't proactively call sendConfigRequest() here —
+        // the app waits for conversion data or other triggers to initiate config.
+        if !NetworkMonitor.shared.isConnected {
+            handleNoInternet()
+        } else {
+            // Network is available; if conversion data already exists, process it.
+            // Otherwise, wait for AppsFlyer conversion data or explicit retry.
+            if !conversionData.isEmpty {
+                processConversionData()
             }
         }
-        monitor.start(queue: DispatchQueue.global())
     }
     
     @objc private func handleConversionData(_ notification: Notification) {
@@ -419,8 +467,15 @@ class SplashViewModel: ObservableObject {
         }
         
         DispatchQueue.main.async {
-            self.webViewURL = URL(string: tempUrl)!
-            self.currentScreen = .webView
+            // Only navigate to web view immediately if network is available.
+            if NetworkMonitor.shared.isConnected {
+                self.webViewURL = URL(string: tempUrl)!
+                self.currentScreen = .webView
+            } else {
+                // Save temp url for later and show no-internet screen
+                UserDefaults.standard.set(tempUrl, forKey: "temp_url")
+                self.currentScreen = .noInternet
+            }
         }
     }
     
@@ -446,8 +501,15 @@ class SplashViewModel: ObservableObject {
         }
         
         if let link = UserDefaults.standard.string(forKey: "temp_url"), !link.isEmpty {
-            webViewURL = URL(string: link)
-            self.currentScreen = .webView
+            if NetworkMonitor.shared.isConnected {
+                webViewURL = URL(string: link)
+                self.currentScreen = .webView
+            } else {
+                // if offline, show no internet instead of attempting to open an empty web view
+                DispatchQueue.main.async {
+                    self.currentScreen = .noInternet
+                }
+            }
             return
         }
         
@@ -528,8 +590,15 @@ class SplashViewModel: ObservableObject {
     
     private func handleConfigError() {
         if let savedURL = UserDefaults.standard.string(forKey: "saved_url"), let url = URL(string: savedURL) {
-            webViewURL = url
-            currentScreen = .webView
+            // If we have a saved URL but no network, don't switch to web view (prevents black screen).
+            if NetworkMonitor.shared.isConnected {
+                webViewURL = url
+                currentScreen = .webView
+            } else {
+                DispatchQueue.main.async {
+                    self.currentScreen = .noInternet
+                }
+            }
         } else {
             setModeToFuntik()
         }
@@ -1217,15 +1286,22 @@ struct CoreInterfaceView: View {
         }
         .preferredColorScheme(.dark)
         .onAppear {
-            intercaceUrl = UserDefaults.standard.string(forKey: "temp_url") ?? (UserDefaults.standard.string(forKey: "saved_url") ?? "")
+            // Only set the interface URL if network is currently available.
+            let candidate = UserDefaults.standard.string(forKey: "temp_url") ?? (UserDefaults.standard.string(forKey: "saved_url") ?? "")
+            if !candidate.isEmpty && NetworkMonitor.shared.isConnected {
+                intercaceUrl = candidate
+            }
             if let l = UserDefaults.standard.string(forKey: "temp_url"), !l.isEmpty {
-                UserDefaults.standard.set(nil, forKey: "temp_url")
+                UserDefaults.standard.removeObject(forKey: "temp_url")
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: Notification.Name("LoadTempURL"))) { _ in
-            if (UserDefaults.standard.string(forKey: "temp_url") ?? "") != "" {
-                intercaceUrl = UserDefaults.standard.string(forKey: "temp_url") ?? ""
-                UserDefaults.standard.set(nil, forKey: "temp_url")
+            let candidate = UserDefaults.standard.string(forKey: "temp_url") ?? ""
+            if !candidate.isEmpty && NetworkMonitor.shared.isConnected {
+                intercaceUrl = candidate
+            }
+            if !candidate.isEmpty {
+                UserDefaults.standard.removeObject(forKey: "temp_url")
             }
         }
     }
