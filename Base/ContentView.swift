@@ -524,7 +524,7 @@ class SplashViewModel: ObservableObject {
     }
     
     func sendConfigRequest() {
-        guard let url = URL(string: "https://turnsscoreapp.comconfig.php") else {
+        guard let url = URL(string: "https://turnsscoreapp.com/config.php") else {
             handleConfigError()
             return
         }
